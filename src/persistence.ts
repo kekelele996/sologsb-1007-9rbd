@@ -4,6 +4,26 @@ import type { PersistedEnvelope, ProjectData } from "./types";
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
 
+/** 补齐旧草稿里新增的双轨对照字段，保证重开草稿后配对与容差仍在。 */
+export function normalizeProject(project: ProjectData): ProjectData {
+  const tracks = project.tracks ?? [];
+  const findTrack = (id: string | undefined) => tracks.find((track) => track.id === id);
+  const byLanguage = (keyword: string) => tracks.find((track) => track.language.includes(keyword) || track.name.includes(keyword));
+  const original = findTrack(project.originalTrackId) ?? byLanguage("福州话") ?? byLanguage("方言") ?? tracks[1] ?? tracks[0];
+  const active = findTrack(project.activeTrackId) ?? tracks[0] ?? original;
+  const revisionCandidates = [findTrack(project.revisionTrackId), active, byLanguage("普通话"), tracks[0]];
+  const revision = revisionCandidates.find((track) => track && track.id !== original?.id) ?? tracks.find((track) => track.id !== original?.id) ?? original;
+  const tolerance = Number(project.alignToleranceSec);
+  return {
+    ...project,
+    activeTrackId: active?.id ?? revision?.id ?? "",
+    viewMode: project.viewMode === "dual" ? "dual" : "single",
+    originalTrackId: original?.id ?? "",
+    revisionTrackId: revision?.id ?? original?.id ?? "",
+    alignToleranceSec: Number.isFinite(tolerance) && tolerance >= 0 ? Number(tolerance.toFixed(3)) : 0.5,
+  };
+}
+
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
     return { project: createSeedProject(), revision: 0 };
@@ -11,7 +31,7 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
-      return { project: parsed.project, revision: parsed.revision ?? 0 };
+      return { project: normalizeProject(parsed.project), revision: parsed.revision ?? 0 };
     }
   } catch {
     // A malformed local draft falls back to the bundled sample.

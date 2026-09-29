@@ -60,7 +60,16 @@ export interface ProjectData {
   title: string;
   interviewee: string;
   recordingDate: string;
+  /** 单轨校对模式下当前编辑的轨道。 */
   activeTrackId: string;
+  /** 主视图：单轨校对 或 双轨对照台。 */
+  viewMode: "single" | "dual";
+  /** 双轨对照台：只读原音轨。 */
+  originalTrackId: string;
+  /** 双轨对照台：可编辑校订轨。 */
+  revisionTrackId: string;
+  /** 两轨起止时间视为对齐的容差（秒），随草稿保存。 */
+  alignToleranceSec: number;
   speakers: Speaker[];
   tags: Tag[];
   tracks: TranscriptTrack[];

@@ -64,6 +64,10 @@ export const createSeedProject = (): ProjectData => {
     interviewee: "林阿婆",
     recordingDate: "2026-08-18",
     activeTrackId: "track-zh",
+    viewMode: "dual",
+    originalTrackId: "track-fangyan",
+    revisionTrackId: "track-zh",
+    alignToleranceSec: 0.5,
     speakers: [
       { id: "sp-interviewer", name: "采访者", role: "研究者", color: "#2563eb" },
       { id: "sp-lin", name: "林阿婆", role: "口述人", color: "#be185d" },
