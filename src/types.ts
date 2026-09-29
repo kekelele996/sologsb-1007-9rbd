@@ -55,12 +55,19 @@ export interface TranscriptTrack {
   segments: Segment[];
 }
 
+export interface DualTrackConfig {
+  originalTrackId: string;
+  revisionTrackId: string;
+  toleranceSec: number;
+}
+
 export interface ProjectData {
   id: string;
   title: string;
   interviewee: string;
   recordingDate: string;
   activeTrackId: string;
+  dualTrack: DualTrackConfig | null;
   speakers: Speaker[];
   tags: Tag[];
   tracks: TranscriptTrack[];

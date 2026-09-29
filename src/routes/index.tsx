@@ -13,6 +13,8 @@ import {
   untrack,
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
+import { DualConsole } from "../dual-console";
+import { buildAlignment, clampTolerance, defaultDualConfig, resolveDual } from "../dual-track";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
 import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
 
@@ -115,6 +117,8 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [viewMode, setViewMode] = createSignal<"single" | "dual">(loaded.project.dualTrack ? "dual" : "single");
+  const [dualScale, setDualScale] = createSignal(6);
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -127,6 +131,22 @@ export default function OralHistoryEditor() {
     return data.tracks.find((track) => track.id === data.activeTrackId) ?? data.tracks[0];
   });
   const activeSegment = createMemo(() => activeTrack()?.segments.find((item) => item.id === selectedId()) ?? null);
+  const dual = createMemo(() => resolveDual(project(), project().dualTrack));
+  const alignment = createMemo(() => {
+    const current = dual();
+    return current ? buildAlignment(current) : null;
+  });
+  /** 双轨台里所有校对动作都落在可编辑的校订轨上，原音轨保持只读。 */
+  const editTrack = createMemo<TranscriptTrack | undefined>(() =>
+    viewMode() === "dual" ? dual()?.revision : activeTrack(),
+  );
+  const editSegment = createMemo<Segment | null>(() => {
+    if (viewMode() === "dual") {
+      const revision = dual()?.revision;
+      return revision?.segments.find((item) => item.id === selectedId()) ?? null;
+    }
+    return activeSegment();
+  });
   const visibleSegments = createMemo(() => {
     const segments = activeTrack()?.segments ?? [];
     if (trackFilter() === "unreviewed") return segments.filter((segment) => !segment.reviewed);
@@ -160,7 +180,8 @@ export default function OralHistoryEditor() {
   const commitSegment = (label: string, mutate: (segment: Segment, draft: ProjectData) => void) => {
     const id = selectedId();
     commit(label, (draft) => {
-      const track = draft.tracks.find((item) => item.id === draft.activeTrackId);
+      const trackId = viewMode() === "dual" ? project().dualTrack?.revisionTrackId : project().activeTrackId;
+      const track = draft.tracks.find((item) => item.id === trackId);
       const segment = track?.segments.find((item) => item.id === id);
       if (segment) mutate(segment, draft);
     });
@@ -191,26 +212,28 @@ export default function OralHistoryEditor() {
   };
 
   const switchTrack = (trackId: string) => {
+    setViewMode("single");
     commit("切换文本轨", (draft) => {
       draft.activeTrackId = trackId;
-      selectedIdSet(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
+      setSelectedId(draft.tracks.find((track) => track.id === trackId)?.segments[0]?.id ?? "");
     });
   };
 
-  const selectedIdSet = (id: string) => setSelectedId(id);
-
   const moveSelection = (direction: 1 | -1) => {
-    const segments = activeTrack()?.segments ?? [];
+    const segments = editTrack()?.segments ?? [];
     if (!segments.length) return;
     const index = Math.max(0, segments.findIndex((segment) => segment.id === selectedId()));
     const nextIndex = (index + direction + segments.length) % segments.length;
     setSelectedId(segments[nextIndex].id);
-    document.getElementById(`segment-${segments[nextIndex].id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    document
+      .getElementById(`segment-${segments[nextIndex].id}`)
+      ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   };
 
   const splitSelection = () => {
-    const segment = activeSegment();
-    if (!segment || segment.text.trim().length < 2) return;
+    const track = editTrack();
+    const segment = editSegment();
+    if (!track || !segment || segment.text.trim().length < 2) return;
     const cursor = editorRef?.selectionStart ?? Math.floor(segment.text.length / 2);
     const safeCursor = Math.max(1, Math.min(cursor, segment.text.length - 1));
     const firstText = segment.text.slice(0, safeCursor).trim();
@@ -219,41 +242,54 @@ export default function OralHistoryEditor() {
     const ratio = firstText.length / segment.text.length;
     const boundary = segment.start + (segment.end - segment.start) * ratio;
     const secondId = uid("seg");
-    commitSegment("拆分片段", (current, draft) => {
+    const trackId = track.id;
+    // 拆分只发生在校订轨内部，按文字比例切分校订片段自身的时间，原音轨起止完全不动。
+    commit("拆分校订片段", (draft) => {
+      const current = draft.tracks
+        .find((item) => item.id === trackId)
+        ?.segments.find((item) => item.id === segment.id);
+      if (!current) return;
       const original = structuredClone(current);
       current.text = firstText;
       current.end = Number(boundary.toFixed(1));
-      const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
-      if (trackIndex >= 0) {
-        const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
-        draft.tracks[trackIndex].segments.splice(segmentIndex + 1, 0, {
-          ...original,
-          id: secondId,
-          start: Number(boundary.toFixed(1)),
-          text: secondText,
-          reviewed: false,
-          comments: [],
-        });
-      }
+      const targetTrack = draft.tracks.find((item) => item.id === trackId);
+      const segmentIndex = targetTrack!.segments.findIndex((item) => item.id === current.id);
+      targetTrack!.segments.splice(segmentIndex + 1, 0, {
+        ...original,
+        id: secondId,
+        start: Number(boundary.toFixed(1)),
+        text: secondText,
+        reviewed: false,
+        comments: [],
+      });
       setSelectedId(secondId);
     });
   };
 
   const mergeWithNext = () => {
-    const track = activeTrack();
-    const segment = activeSegment();
+    const track = editTrack();
+    const segment = editSegment();
     if (!track || !segment) return;
     const index = track.segments.findIndex((item) => item.id === segment.id);
     const next = track.segments[index + 1];
     if (!next) return;
-    commitSegment("合并下一片段", (current, draft) => {
-      current.text = `${current.text.trim()} ${next.text.trim()}`;
-      current.end = next.end;
-      current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
-      current.comments.push(...next.comments);
-      current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
-      const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
-      sourceTrack?.segments.splice(index + 1, 1);
+    const trackId = track.id;
+    const nextId = next.id;
+    // 合并同样只改校订轨：吸收下一段的文字与结束时间，原音轨不参与、不变形。
+    commit("合并校订片段", (draft) => {
+      const sourceTrack = draft.tracks.find((item) => item.id === trackId);
+      const current = sourceTrack?.segments.find((item) => item.id === segment.id);
+      const following = sourceTrack?.segments.find((item) => item.id === nextId);
+      if (!sourceTrack || !current || !following) return;
+      current.text = `${current.text.trim()} ${following.text.trim()}`;
+      current.end = following.end;
+      current.tagIds = [...new Set([...current.tagIds, ...following.tagIds])];
+      current.comments.push(...following.comments);
+      current.confidence = Math.min(current.confidence, following.confidence) as Confidence;
+      sourceTrack.segments.splice(
+        sourceTrack.segments.findIndex((item) => item.id === nextId),
+        1,
+      );
       current.reviewed = false;
     });
   };
@@ -322,11 +358,12 @@ export default function OralHistoryEditor() {
   };
 
   const exportSrt = () => {
-    const lines = activeTrack().segments.map((segment, index) => {
+    const track = viewMode() === "dual" ? dual()?.revision ?? activeTrack() : activeTrack();
+    const lines = track.segments.map((segment, index) => {
       const speaker = speakerById(segment.speakerId)?.name ?? "未知";
       return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
     });
-    downloadText(`${project().title}-${activeTrack().name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
+    downloadText(`${project().title}-${track.name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
   };
 
   const importFile = async (file: File) => {
@@ -359,6 +396,75 @@ export default function OralHistoryEditor() {
       dirty = true;
     }
     setConflict(null);
+  };
+
+  const enterDualView = () => {
+    const currentDual = dual();
+    if (currentDual) {
+      const revisionId = currentDual.revision.id;
+      const selectionInRevision = currentDual.revision.segments.some((segment) => segment.id === selectedId());
+      const needsCommit = project().activeTrackId !== revisionId || !selectionInRevision;
+      setViewMode("dual");
+      if (needsCommit) {
+        commit("进入双轨对照台", (draft) => {
+          draft.activeTrackId = revisionId;
+          if (!draft.tracks.find((track) => track.id === revisionId)?.segments.some((segment) => segment.id === selectedId())) {
+            setSelectedId(draft.tracks.find((track) => track.id === revisionId)?.segments[0]?.id ?? "");
+          }
+        });
+      }
+      return;
+    }
+    const suggested = defaultDualConfig(project());
+    if (!suggested) return;
+    setViewMode("dual");
+    commit("进入双轨对照台", (draft) => {
+      draft.dualTrack = suggested;
+      draft.activeTrackId = suggested.revisionTrackId;
+      setSelectedId(
+        draft.tracks.find((track) => track.id === suggested.revisionTrackId)?.segments[0]?.id ?? "",
+      );
+    });
+  };
+
+  const leaveDualView = () => setViewMode("single");
+
+  const handleDualSelect = (id: string, side: "original" | "revision") => {
+    setSelectedId(id);
+    if (side === "revision") {
+      queueMicrotask(() => editorRef?.focus());
+    }
+  };
+
+  const changeTolerance = (value: number) => {
+    const clamped = clampTolerance(value);
+    const currentConfig = project().dualTrack;
+    if (currentConfig && clampTolerance(currentConfig.toleranceSec) === clamped) return;
+    commit("调整对齐容差", (draft) => {
+      if (draft.dualTrack) {
+        draft.dualTrack.toleranceSec = clamped;
+      } else {
+        const suggested = defaultDualConfig(draft);
+        if (suggested) draft.dualTrack = { ...suggested, toleranceSec: clamped };
+      }
+    });
+  };
+
+  const changePairTrack = (side: "original" | "revision", trackId: string) => {
+    const current = dual();
+    if (!current) return;
+    const nextOriginalId = side === "original" ? trackId : current.original.id;
+    const nextRevisionId = side === "revision" ? trackId : current.revision.id;
+    if (nextOriginalId === nextRevisionId) return;
+    commit("更换双轨配对", (draft) => {
+      if (!draft.dualTrack) return;
+      draft.dualTrack.originalTrackId = nextOriginalId;
+      draft.dualTrack.revisionTrackId = nextRevisionId;
+      if (side === "revision") {
+        draft.activeTrackId = nextRevisionId;
+        setSelectedId(draft.tracks.find((track) => track.id === nextRevisionId)?.segments[0]?.id ?? "");
+      }
+    });
   };
 
   onMount(() => {
@@ -401,7 +507,7 @@ export default function OralHistoryEditor() {
       } else if (event.key.toLowerCase() === "m") {
         event.preventDefault();
         mergeWithNext();
-      } else if (event.key.toLowerCase() === "r" && activeSegment()) {
+      } else if (event.key.toLowerCase() === "r" && editSegment()) {
         event.preventDefault();
         commitSegment("标记片段已校对", (segment) => { segment.reviewed = true; });
       } else if (event.key === "?" || (event.shiftKey && event.key === "/")) {
@@ -546,61 +652,92 @@ export default function OralHistoryEditor() {
         </aside>
 
         <main class="transcript-panel">
-          <div class="panel-toolbar">
+          <div class="panel-toolbar dual-aware-toolbar">
             <div>
-              <div class="eyebrow">当前轨道</div>
-              <h1>{activeTrack().name}</h1>
+              <div class="eyebrow">{viewMode() === "dual" ? "双轨对照台" : "当前轨道"}</div>
+              <h1>{viewMode() === "dual" && dual() ? `${dual()!.original.name} ⇄ ${dual()!.revision.name}` : activeTrack().name}</h1>
             </div>
-            <div class="filters" role="group" aria-label="片段筛选">
-              <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
-              <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
-              <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
+            <div class="toolbar-right">
+              <div class="view-switch" role="group" aria-label="视图切换">
+                <button class={viewMode() === "single" ? "active" : ""} onClick={leaveDualView}>单轨</button>
+                <button class={viewMode() === "dual" ? "active" : ""} onClick={enterDualView} disabled={project().tracks.length < 2}>双轨对照</button>
+              </div>
+              <Show when={viewMode() === "single"}>
+                <div class="filters" role="group" aria-label="片段筛选">
+                  <button class={trackFilter() === "all" ? "active" : ""} onClick={() => setTrackFilter("all")}>全部</button>
+                  <button class={trackFilter() === "unreviewed" ? "active" : ""} onClick={() => setTrackFilter("unreviewed")}>未校对</button>
+                  <button class={trackFilter() === "low" ? "active" : ""} onClick={() => setTrackFilter("low")}>低置信</button>
+                </div>
+              </Show>
             </div>
           </div>
 
-          <div class="transcript-list" role="listbox" aria-label="转写片段">
-            <For each={visibleSegments()}>
-              {(segment, index) => (
-                <article
-                  id={`segment-${segment.id}`}
-                  role="option"
-                  aria-selected={segment.id === selectedId()}
-                  class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
-                  onClick={() => clickSegment(segment.id)}
-                >
-                  <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
-                  <div class="segment-time">
-                    <span>{formatTime(segment.start, false)}</span>
-                    <small>{formatTime(segment.end, false)}</small>
-                  </div>
-                  <div class="segment-body">
-                    <div class="segment-meta">
-                      <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
-                      <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
-                      <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
-                      <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
-                      <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
-                      <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+          <Show when={viewMode() === "dual" && dual() && alignment()} fallback={
+            <div class="transcript-list" role="listbox" aria-label="转写片段">
+              <For each={visibleSegments()}>
+                {(segment, index) => (
+                  <article
+                    id={`segment-${segment.id}`}
+                    role="option"
+                    aria-selected={segment.id === selectedId()}
+                    class={`segment-card ${segment.id === selectedId() ? "selected" : ""} ${segment.reviewed ? "reviewed" : ""}`}
+                    onClick={() => clickSegment(segment.id)}
+                  >
+                    <div class="segment-rail" style={{ background: speakerById(segment.speakerId)?.color ?? "#64748b" }} />
+                    <div class="segment-time">
+                      <span>{formatTime(segment.start, false)}</span>
+                      <small>{formatTime(segment.end, false)}</small>
                     </div>
-                    <p>{segment.text}</p>
-                    <div class="segment-tags">
-                      <For each={segment.tagIds.map(tagById).filter(Boolean)}>
-                        {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
-                      </For>
+                    <div class="segment-body">
+                      <div class="segment-meta">
+                        <b>{speakerById(segment.speakerId)?.name ?? "未知发言人"}</b>
+                        <span class={`confidence c${segment.confidence}`}>置信 {segment.confidence}/5</span>
+                        <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
+                        <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
+                        <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
+                        <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
+                      </div>
+                      <p>{segment.text}</p>
+                      <div class="segment-tags">
+                        <For each={segment.tagIds.map(tagById).filter(Boolean)}>
+                          {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
+                        </For>
+                      </div>
                     </div>
-                  </div>
-                  <span class="segment-index">{index() + 1}</span>
-                </article>
-              )}
-            </For>
-            <Show when={!visibleSegments().length}>
-              <div class="empty-state"><b>没有符合筛选条件的片段</b><span>切换到“全部”继续校对。</span></div>
-            </Show>
-          </div>
+                    <span class="segment-index">{index() + 1}</span>
+                  </article>
+                )}
+              </For>
+              <Show when={!visibleSegments().length}>
+                <div class="empty-state"><b>没有符合筛选条件的片段</b><span>切换到“全部”继续校对。</span></div>
+              </Show>
+            </div>
+          }>
+            <DualConsole
+              dual={dual()!}
+              alignment={alignment()!}
+              project={project()}
+              selectedId={selectedId()}
+              scale={dualScale()}
+              onSelect={handleDualSelect}
+              onChangeTolerance={changeTolerance}
+              onChangePairTrack={changePairTrack}
+              onChangeScale={setDualScale}
+            />
+          </Show>
         </main>
 
         <aside class="inspector">
-          <Show when={activeSegment()} fallback={<div class="empty-inspector"><b>选择一个片段</b><p>在中间列表点击片段后即可校正发言人、置信度、标记和批注。</p></div>}>
+          <Show when={editSegment()} fallback={
+            <div class="empty-inspector">
+              <b>{viewMode() === "dual" ? "当前选中的是原音片段" : "选择一个片段"}</b>
+              <p>
+                {viewMode() === "dual"
+                  ? "原音轨只读，不能直接修改。点击右侧校订轨上对应的片段（已描边提示），即可在此改字、改时、拆分或合并。"
+                  : "在中间列表点击片段后即可校正发言人、置信度、标记和批注。"}
+              </p>
+            </div>
+          }>
             {(segment) => (
               <Tabs defaultValue="correct" class="inspector-tabs">
                 <Tabs.List class="tab-list">
@@ -611,11 +748,18 @@ export default function OralHistoryEditor() {
 
                 <Tabs.Content value="correct" class="tab-content">
                   <div class="inspector-heading">
-                    <div><span>片段 {activeTrack().segments.findIndex((item) => item.id === segment().id) + 1}</span><strong>{formatTime(segment().start, false)} — {formatTime(segment().end, false)}</strong></div>
+                    <div>
+                      <span>{editTrack()?.name} · 片段 {(editTrack()?.segments.findIndex((item) => item.id === segment().id) ?? -1) + 1}</span>
+                      <strong>{formatTime(segment().start, false)} — {formatTime(segment().end, false)}</strong>
+                    </div>
                     <button class={`review-button ${segment().reviewed ? "done" : ""}`} onClick={() => commitSegment("标记片段已校对", (item) => { item.reviewed = true; })}>
                       {segment().reviewed ? "✓ 已校对" : "标记已校对"}
                     </button>
                   </div>
+
+                  <Show when={viewMode() === "dual"}>
+                    <div class="dual-inspector-note">正在校对校订轨；左侧原音轨为只读参照，拆分或合并不会改动原音起止时间。</div>
+                  </Show>
 
                   <label class="field-label" for="speaker-select">发言人</label>
                   <select
@@ -669,7 +813,7 @@ export default function OralHistoryEditor() {
 
                   <div class="split-actions">
                     <button onClick={splitSelection}>⌁ 按光标拆分</button>
-                    <button disabled={activeTrack().segments.at(-1)?.id === segment().id} onClick={mergeWithNext}>合 合并下一段</button>
+                    <button disabled={editTrack()?.segments.at(-1)?.id === segment().id} onClick={mergeWithNext}>合 合并下一段</button>
                   </div>
                 </Tabs.Content>
 
@@ -723,7 +867,11 @@ export default function OralHistoryEditor() {
       <footer class="statusbar">
         <span>最近操作：{lastAction()}</span>
         <span>版本 {revision() + 1} · 本地草稿</span>
-        <span class="status-shortcuts">J/K 浏览　R 已校对　M 合并　? 帮助</span>
+        <span class="status-shortcuts">
+          {viewMode() === "dual"
+            ? "双轨对照：点任意片段两侧同时定位 · 原音只读 · J/K 浏览校订轨 · M 合并"
+            : "J/K 浏览　R 已校对　M 合并　? 帮助"}
+        </span>
       </footer>
 
       <Dialog open={helpOpen()} onOpenChange={setHelpOpen}>
@@ -742,6 +890,10 @@ export default function OralHistoryEditor() {
               <span><kbd>Ctrl/⌘ S</kbd> 立即保存</span>
               <span><kbd>?</kbd> 显示本帮助</span>
             </div>
+            <p style="margin-top:12px;font-size:12px;color:#68737c;line-height:1.6">
+              “双轨对照”把方言原音轨与普通话校订轨放在同一时间轴：点击任一侧片段，两侧会一起滚动定位；
+              原音轨只读，拆分、合并和改时只作用于校订轨，不会改动原音起止。对齐容差随草稿保存，重开页面仍生效。
+            </p>
             <div class="dialog-footer"><button class="btn btn-primary" onClick={() => setHelpOpen(false)}>开始校对</button></div>
           </Dialog.Content>
         </Dialog.Portal>
